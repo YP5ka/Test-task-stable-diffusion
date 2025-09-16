@@ -1,0 +1,10 @@
+accelerate>=0.23.0
+torch>=2.1
+torchvision
+pillow
+safetensors
+tqdm
+torchvision
+transformers>=4.33
+diffusers>=0.25.0
+peft>=0.7.0
