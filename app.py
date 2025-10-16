@@ -15,7 +15,7 @@ with st.sidebar:
     st.header("Settings")
     cfg = read_config()
     default_device = "cuda"
-    lora_path = st.text_input("LoRA path", value=str(Path("outputs/lora").resolve()))
+    lora_path = st.text_input("LoRA path", value=str(Path("outputs").resolve()))
     device = st.selectbox("Device", options=["cuda", "cpu", "mps"], index=0)
     num_images = st.number_input("Num images", min_value=1, max_value=16, value=4, step=1)
     steps = st.number_input("Inference steps", min_value=10, max_value=75, value=35, step=5)
