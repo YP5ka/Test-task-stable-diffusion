@@ -16,20 +16,41 @@ from peft import get_peft_model, LoraConfig
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from utils_fit_lora import parse_args
-
-
-def _safe_enable_xformers(pipe: StableDiffusionPipeline) -> None:
-    try:
-        pipe.enable_xformers_memory_efficient_attention()
-    except Exception as _:
-        pass
-
+from utils import _safe_enable_xformers, read_config
 
 if __name__ == "__main__":
     print("Начало обучения модели stable diffusion")
     args = parse_args()
     print(f"Args parsed successfully: {args=}")
     logger.info(f"Starting training with args: {args}")
+
+    # Load configuration (optional, values can be overridden by CLI in future)
+    cfg = read_config()
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    effective_resolution = int(model_cfg.get("resolution", args.resolution))
+
+    # Basic validations for training inputs
+    train_dir = Path(args.train_data_dir)
+    if not train_dir.exists() or not train_dir.is_dir():
+        raise FileNotFoundError(f"--train_data_dir not found or not a directory: {train_dir}")
+
+    if args.output_folder is None or str(args.output_folder).strip() == "":
+        raise ValueError("--output_folder must be provided")
+
+    if args.resolution is None or args.resolution <= 0:
+        raise ValueError("--resolution must be a positive integer")
+
+    if args.batch_size is None or args.batch_size <= 0:
+        raise ValueError("--batch_size must be a positive integer")
+
+    if args.epochs is None or args.epochs <= 0:
+        raise ValueError("--epochs must be a positive integer")
+
+    if args.learning_rate is None or args.learning_rate <= 0:
+        raise ValueError("--learning_rate must be a positive float")
+
+    if args.checkpointing_steps is None or args.checkpointing_steps <= 0:
+        raise ValueError("--checkpointing_steps must be a positive integer")
 
     print("Создание директории")
     logs_dir = Path(args.output_folder) / "logs"
@@ -42,7 +63,7 @@ if __name__ == "__main__":
     logger.warning(f"Accelerator initialized on device: {device}")
 
     try:
-        dataset = ImageDataset(args.train_data_dir, resolution=args.resolution)
+        dataset = ImageDataset(args.train_data_dir, resolution=effective_resolution)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=20)
     except Exception as e:
         print(str(e))
@@ -52,32 +73,57 @@ if __name__ == "__main__":
     # Load model & tokenizer
     logger.info("Загрузка Stable Diffusion ")
     print("Загрузка stable-diffusion")
-    model_id = "runwayml/stable-diffusion-v1-5"
+    model_id = model_cfg.get("base_model", "runwayml/stable-diffusion-v1-5")
+
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    dtype_name = str(model_cfg.get("dtype", "")).lower()
+    if dtype_name in ("float16", "fp16", "half"):
+        dtype = torch.float16
+    elif dtype_name in ("float32", "fp32"):
+        dtype = torch.float32
+    elif dtype_name in ("bfloat16", "bf16"):
+        dtype = torch.bfloat16
+
     pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype).to(device)
     _safe_enable_xformers(pipe)
     tokenizer: AutoTokenizer = pipe.tokenizer
 
     print("Конфиг модели")
+    lora_cfg = (cfg.get("lora", {}) if isinstance(cfg, dict) else {})
     lora_config = LoraConfig(
-        r=8,
-        lora_alpha=2,
+        r=int(lora_cfg.get("r", 8)),
+        lora_alpha=int(lora_cfg.get("lora_alpha", 2)),
         bias="none",
-        target_modules=["to_k", "to_q", "to_v"],
-        lora_dropout=0.15,
+        target_modules=list(lora_cfg.get("target_modules", ["to_k", "to_q", "to_v"])),
+        lora_dropout=float(lora_cfg.get("lora_dropout", 0.15)),
     )
     unet = get_peft_model(pipe.unet, lora_config)
     unet.train()
 
-    optimizer = torch.optim.Adam(unet.parameters(), lr=args.learning_rate)
+    training_cfg = (cfg.get("training", {}) if isinstance(cfg, dict) else {})
+    effective_batch_size = int(training_cfg.get("batch_size", args.batch_size))
+    effective_epochs = int(training_cfg.get("epochs", args.epochs))
+    effective_lr = float(training_cfg.get("learning_rate", args.learning_rate))
+    effective_ckpt_steps = int(training_cfg.get("checkpointing_steps", args.checkpointing_steps))
+    effective_num_workers = int(training_cfg.get("num_workers", 20))
+
+    # Rebuild dataloader if num_workers overridden by config
+    if effective_num_workers != 20:
+        dataloader = DataLoader(dataset, batch_size=effective_batch_size, shuffle=True, num_workers=effective_num_workers)
+    else:
+        # If batch size overridden but workers not, ensure consistent dataloader
+        if effective_batch_size != args.batch_size:
+            dataloader = DataLoader(dataset, batch_size=effective_batch_size, shuffle=True, num_workers=20)
+
+    optimizer = torch.optim.Adam(unet.parameters(), lr=effective_lr)
     unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
 
-    print(f"Starting training for {args.epochs} epochs...")
-    logger.info(f"Starting training for {args.epochs} epochs...")
+    print(f"Starting training for {effective_epochs} epochs...")
+    logger.info(f"Starting training for {effective_epochs} epochs...")
     global_step = 0
-    for epoch in range(args.epochs):
-        print(f"Эпоха = {epoch + 1}/{args.epochs}")
-        logger.info(f"epoch = {epoch + 1}/{args.epochs}")
+    for epoch in range(effective_epochs):
+        print(f"Эпоха = {epoch + 1}/{effective_epochs}")
+        logger.info(f"epoch = {epoch + 1}/{effective_epochs}")
         for batch_idx, batch in enumerate(dataloader):
             with accelerator.accumulate(unet):
                 pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)
@@ -106,7 +152,7 @@ if __name__ == "__main__":
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
+            if accelerator.is_main_process and global_step % effective_ckpt_steps == 0:
                 ckpt_dir = Path(args.output_folder) / f"step_{global_step}"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 unet.save_pretrained(ckpt_dir)

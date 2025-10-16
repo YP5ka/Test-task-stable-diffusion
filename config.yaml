@@ -1,0 +1,19 @@
+model:
+  base_model: "runwayml/stable-diffusion-v1-5"
+  resolution: 512
+  dtype: "float32"
+
+lora:
+  r: 8
+  lora_alpha: 2
+  target_modules: ["to_k", "to_q", "to_v"]
+  lora_dropout: 0.15
+
+training:
+  batch_size: 2
+  epochs: 10
+  learning_rate: 1e-4
+  checkpointing_steps: 100
+  num_workers: 4
+
+

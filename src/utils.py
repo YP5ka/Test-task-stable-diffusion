@@ -1,4 +1,5 @@
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
+from pathlib import Path
 
 import torch
 from diffusers import StableDiffusionPipeline
@@ -6,6 +7,7 @@ from peft import PeftModel, PeftConfig
 from PIL import Image
 
 import argparse
+import yaml
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -24,9 +26,32 @@ def load_pipe(
         device,
         base_model = "runwayml/stable-diffusion-v1-5"):
     logger.info("start load pipeline")
-    base_model = "runwayml/stable-diffusion-v1-5"
+    cfg = read_config()
+
+    # Resolve base model from config if available
+    base_model = (
+        cfg.get("model", {}).get("base_model")
+        if isinstance(cfg, dict) else base_model
+    ) or base_model
+
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if device == "cuda" else torch.float32
+
+    # Resolve dtype from config if available (fallback to device-based)
+    cfg_dtype = None
+    try:
+        cfg_dtype_name = cfg.get("model", {}).get("dtype") if isinstance(cfg, dict) else None
+        if cfg_dtype_name:
+            cfg_dtype_name = str(cfg_dtype_name).lower()
+            if cfg_dtype_name in ("float16", "fp16", "half"):
+                cfg_dtype = torch.float16
+            elif cfg_dtype_name in ("float32", "fp32"):
+                cfg_dtype = torch.float32
+            elif cfg_dtype_name in ("bfloat16", "bf16"):
+                cfg_dtype = torch.bfloat16
+    except Exception:
+        cfg_dtype = None
+
+    dtype = cfg_dtype or (torch.float16 if device == "cuda" else torch.float32)
 
     pipe = StableDiffusionPipeline.from_pretrained(base_model, torch_dtype=dtype)
     pipe = pipe.to(device)
@@ -47,4 +72,23 @@ def parse_args():
     p.add_argument("--lora_path", type=str, help="Path to folder with LoRA weights (peft model)")
     p.add_argument("--num_images", type=int, default=4)
     p.add_argument("--output_dir", type=str, default="outputs/gen")
+    p.add_argument("--device", type=str, choices=["cuda", "cpu", "mps"], default=None)
     return p.parse_args()
+
+
+def read_config(path: Optional[str] = None) -> Dict[str, Any]:
+    """Read YAML config from project root (config.yaml) unless a path is provided.
+
+    Returns an empty dict if the file is missing or cannot be parsed.
+    """
+    config_path = Path(path) if path else Path(__file__).resolve().parents[1] / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+            if isinstance(data, dict):
+                return data
+            return {}
+    except Exception:
+        return {}
